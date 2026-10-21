@@ -1,24 +1,24 @@
 # SVU LREC Engine — Coolify
 
-محرك خادمي مستقل لتحويل محاضرات Linktivity LREC إلى MP4، باستخدام Node.js 22 وFFmpeg داخل Docker. يظل الموقع الأساسي `https://svu.hussamm.tech` وقاعدة بيانات المشتركين على cPanel كما هما.
+محرك تحويل محاضرات LREC إلى MP4 عبر Docker وFFmpeg، مخصص لموقع `https://svu.hussamm.tech`.
 
-**حالة المشروع:** المستودع جرى إنشاؤه؛ حزمة المصدر v0.1.0 جهّزت واختُبرت محلياً، لكنها لم تُرفع كاملة إلى GitHub بعد. لا توجد Docker Image منشورة حتى يتم رفع المصدر ونجاح GitHub Actions.
+## حالة المشروع
+تم تجهيز مستودع GitHub وWorkflow لبناء Docker ونشر الصورة تلقائياً. **كود المحرك الكامل لم يُرفع إلى المستودع بعد**، والصورة ليست منشورة حتى نجاح بناء GitHub Actions.
 
-## أول رفع للمشروع
+## رفع المصدر من ملف واحد
+1. حمّل الحزمة `SVU-LREC-Coolify-Engine-v0.1.0.zip` من محادثة ChatGPT.
+2. افتح المستودع على GitHub ثم **Add file → Upload files**.
+3. ارفع **ملف ZIP نفسه**، دون فك ضغطه، بنفس الاسم تماماً في جذر المستودع.
+4. اضغط **Commit changes**. سيبدأ `Build and publish SVU LREC Engine` تلقائياً.
+5. افتح تبويب Actions وتأكد من نجاح البناء. الصورة المنتظرة `ghcr.io/hussamalbarouki/svu-lrec-engine:main`.
 
-1. نزّل ملف `SVU-LREC-Coolify-Engine-v0.1.0.zip` المرفق في محادثة ChatGPT.
-2. فك ضغطه محلياً، وادخل إلى مجلد `svu-cloud-engine` (أو افتح ملفات محتويات الحزمة الجديدة مباشرة).
-3. من صفحة هذا المستودع على GitHub اختر **Add file → Upload files** وارفع **محتويات** المشروع وليس ملف ZIP؛ ارفع ملفات `src/` و`.github/workflows/` و`tests/` و`Dockerfile` و`package.json` و`.dockerignore` و`DEPLOY_NOTES_AR.md`. اترك README الحالي إن رفض GitHub استبداله.
-4. بعد Commit، افتح **Actions → Build and publish Docker image** وتحقق من ظهور تشغيل أخضر.
-5. عند نجاحه، استخدم Docker Image في Coolify: `ghcr.io/hussamalbarouki/svu-lrec-engine:main`، المنفذ `3000`.
-
-## Coolify / DNS
-
+بعد نجاح البناء:
+- Coolify → Project → New Resource → Docker Image
+- Image: `ghcr.io/hussamalbarouki/svu-lrec-engine:main`
+- Port: `3000`
 - Domain: `https://engine.svu.hussamm.tech`
-- Cloudflare A record: `engine.svu` → VPS IP مع **DNS only**.
-- Environment: `ENGINE_SHARED_SECRET` (سري عشوائي 32+ حرفاً)، `APP_ORIGIN=https://svu.hussamm.tech`.
-- اختبار الصحة: `https://engine.svu.hussamm.tech/healthz`.
+- Cloudflare DNS: سجل A باسم `engine.svu`، عنوان VPS، DNS only
+- Variables: `APP_ORIGIN=https://svu.hussamm.tech` و `ENGINE_SHARED_SECRET` بقيمة عشوائية لا تقل عن 32 حرفاً
+- المسار الصحي `/healthz`.
 
-**مهم:** الربط بواجهة PHP ونظام الحصص لم يُنفذ بعد. لا تفعل محرك VPS للمستخدمين إلا بعد إنشاء باتش منفصل للموقع الأساسي وتحقق كامل من تحويل محاضرة فعلية على VPS. ملفات LREC لا تخزن على cPanel إطلاقاً؛ المعالجة والملفات المؤقتة تقع حصرياً على VPS.
-
-عند استبدال VPS: ثبّت Coolify من جديد، أضف Docker Image نفسها واضبط البيئة، ثم غيّر DNS A record بعد التأكد من جاهزية المحرك.
+**تنبيه:** الربط بلوحة cPanel ونظام الاشتراكات يحتاج باتشاً منفصلاً. لا تغيّر محرك الموقع الرئيسي قبل تطبيقه واختبار التحويل الحقيقي. ملفات LREC وMP4 لا تُخزن على cPanel.
