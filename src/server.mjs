@@ -1,5 +1,5 @@
 import http from 'node:http';
-import {createHmac,randomUUID,timingSafeEqual} from 'node:crypto';
+import {createHmac,randomUUID,timingSafeEqual,randomBytes} from 'node:crypto';
 import {createWriteStream} from 'node:fs';
 import {mkdir,rm,stat,statfs,unlink,truncate} from 'node:fs/promises';
 import {Transform} from 'node:stream';
@@ -12,7 +12,8 @@ const SECRET=process.env.ENGINE_SHARED_SECRET||'';
 const ORIGIN=process.env.APP_ORIGIN||'https://svu.hussamm.tech';
 const WORK_ROOT=process.env.WORK_ROOT||'/work';
 const MAX_UPLOAD=Math.min(2048,Math.max(1,Number(process.env.MAX_UPLOAD_MB||256)))*1048576;
-const TTL=Number(process.env.RESULT_TTL_MINUTES||30)*60000;
+const TTL=Math.min(120,Math.max(10,Number(process.env.RESULT_TTL_MINUTES||45)))*60000;
+const DL_TTL=10*60000;
 const QUEUE_LIMIT=Number(process.env.QUEUE_LIMIT||2);
 const MAX_CHUNK=4*1048576; // 4 MiB cap; browser sends 1 MiB chunks
 
@@ -36,12 +37,12 @@ function signedToken(req){
 }
 function reply(res,code,obj){if(res.headersSent)return;res.writeHead(code,{'content-type':'application/json; charset=utf-8','cache-control':'no-store','x-content-type-options':'nosniff'});res.end(JSON.stringify(obj));}
 function err(res,code,message){reply(res,code,{error:message});}
-function status(job){return {job_id:job.id,status:job.status,progress:job.progress,stage:job.stage,created_at:job.created,finished_at:job.finished||null,report:job.status==='complete'?job.report:undefined,error:job.status==='failed'?job.error:undefined};}
+function status(job){return {job_id:job.id,status:job.status,progress:job.progress,stage:job.stage,created_at:job.created,finished_at:job.finished||null,report:job.status==='complete'?job.report:undefined,error:job.status==='failed'?job.error:undefined,output_bytes:job.status==='complete'?job.bytes:undefined};}
 function pump(){
   if(active||queue.length===0)return;
   const job=queue.shift();active=job;job.status='processing';job.stage='بدء المعالجة';
   runConversion(join(job.dir,'upload.lrec'),job.dir,(stage,progress)=>{job.stage=stage;job.progress=Math.max(0,Math.min(100,Number(progress)||0))})
-    .then(({report})=>{job.status='complete';job.progress=100;job.stage='جاهز للتنزيل';job.report=report;job.finished=Date.now();})
+    .then(async ({report})=>{const output=await stat(join(job.dir,'result.mp4'));if(output.size<2048)throw Error('Output MP4 is not ready');job.bytes=output.size;job.status='complete';job.progress=100;job.stage='جاهز للتنزيل';job.report=report;job.finished=Date.now();})
     .catch(e=>{console.error('Job',job.id,'failed:',e);job.status='failed';job.error=String(e.message||e).slice(0,300);job.finished=Date.now();})
     .finally(async()=>{try{await unlink(join(job.dir,'upload.lrec'))}catch{};active=null;pump();});
 }
@@ -59,11 +60,24 @@ const server=http.createServer(async(req,res)=>{
     if(origin && origin!==ORIGIN)return err(res,403,'Origin not allowed');
     if(origin===ORIGIN){res.setHeader('access-control-allow-origin',ORIGIN);res.setHeader('vary','Origin');res.setHeader('access-control-allow-methods','GET,POST,DELETE,OPTIONS');res.setHeader('access-control-allow-headers','Authorization,Content-Type,X-Upload-Total,X-Upload-Offset');res.setHeader('access-control-max-age','300');}
     if(req.method==='OPTIONS'){res.writeHead(204);res.end();return;}
-    const pathname=new URL(req.url,'http://localhost').pathname;
-    if(pathname==='/healthz'&&req.method==='GET')return reply(res,200,{status:'ok',engine:'svu-lrec-native',version:'0.2.0',features:{chunk_upload:true,max_chunk_bytes:MAX_CHUNK},active:active?1:0,queued:queue.length});
-    const hit=/^\/api\/jobs\/([0-9a-f-]{36})(?:\/(upload\/(?:init|state|chunk|finish)|upload|output))?$/.exec(pathname);
+    const parsedURL=new URL(req.url,'http://localhost');const pathname=parsedURL.pathname;
+    if(pathname==='/healthz'&&req.method==='GET')return reply(res,200,{status:'ok',engine:'svu-lrec-native',version:'0.3.0',features:{chunk_upload:true,direct_download:true,max_chunk_bytes:MAX_CHUNK},active:active?1:0,queued:queue.length});
+    const hit=/^\/api\/jobs\/([0-9a-f-]{36})(?:\/(upload\/(?:init|state|chunk|finish)|upload|output|download-link))?$/.exec(pathname);
     if(!hit)return err(res,404,'Not found');
-    const id=hit[1],action=hit[2]||'',claims=signedToken(req);
+    const id=hit[1],action=hit[2]||'';
+    // Native browser download bypasses JS memory and avoids expensive Blob copies.
+    if(action==='output'&&req.method==='GET'&&parsedURL.searchParams.has('dl')){
+      const job=jobs.get(id),given=parsedURL.searchParams.get('dl')||'';
+      if(!job||job.status!=='complete'||!job.downloadTicket||Date.now()>job.downloadUntil||!(/^[a-f0-9]{64}$/.test(given)))return err(res,403,'Download link expired');
+      const a=Buffer.from(given,'hex'),b=Buffer.from(job.downloadTicket,'hex');
+      if(a.length!==b.length||!timingSafeEqual(a,b))return err(res,403,'Download link invalid');
+      const {createReadStream}=await import('node:fs');const file=join(job.dir,'result.mp4');const meta=await stat(file);
+      if(meta.size!==job.bytes)return err(res,409,'MP4 verification mismatch');
+      res.writeHead(200,{'content-type':'video/mp4','content-length':meta.size,'content-disposition':'attachment; filename="lecture.mp4"',
+        'cache-control':'private, no-store','referrer-policy':'no-referrer','x-content-type-options':'nosniff','accept-ranges':'none'});
+      createReadStream(file).on('error',()=>res.destroy()).pipe(res);return;
+    }
+    const claims=signedToken(req);
     if(id!==claims.job_id)return err(res,403,'Token not valid for this job');
     // Resumable direct-to-VPS upload. The main website never receives file contents.
     if(action==='upload/init'&&req.method==='POST'){
@@ -142,6 +156,13 @@ const server=http.createServer(async(req,res)=>{
       jobs.delete(id);const at=queue.indexOf(job);if(at!==-1)queue.splice(at,1);
       await rm(job.dir,{recursive:true,force:true});return reply(res,200,{status:'removed'});
     }
+    if(action==='download-link'&&req.method==='POST'){
+      if(job.status!=='complete')return err(res,409,'Output not ready');
+      const file=join(job.dir,'result.mp4');const meta=await stat(file);
+      if(meta.size<2048||meta.size!==job.bytes)return err(res,409,'Verified MP4 unavailable');
+      if(!job.downloadTicket||Date.now()>job.downloadUntil){job.downloadTicket=randomBytes(32).toString('hex');job.downloadUntil=Date.now()+Math.min(DL_TTL,Math.max(30000,TTL-(Date.now()-job.finished)-30000));}
+      return reply(res,200,{url:'https://engine.svu.hussamm.tech'+pathname.replace(/download-link$/,'output')+'?dl='+job.downloadTicket,bytes:meta.size,expires_at:job.downloadUntil});
+    }
     if(action==='output'&&req.method==='GET'){
       if(job.status!=='complete')return err(res,409,'Output not ready');
       const {createReadStream}=await import('node:fs');const file=join(job.dir,'result.mp4');const meta=await stat(file);
@@ -152,4 +173,4 @@ const server=http.createServer(async(req,res)=>{
   }catch(e){console.error('Request rejected:',String(e.message||e));if(!res.headersSent)err(res,401,'Unauthorized or invalid request');else res.destroy();}
 });
 server.requestTimeout=30*60*1000;server.headersTimeout=20000;
-server.listen(PORT,'0.0.0.0',()=>console.log(`SVU LREC native engine v0.2.0 on :${PORT}`));
+server.listen(PORT,'0.0.0.0',()=>console.log(`SVU LREC native engine v0.3.0 on :${PORT}`));
