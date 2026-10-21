@@ -93,13 +93,14 @@ const server=http.createServer(async(req,res)=>{
       if(!job||job.status!=='uploading'||!Number.isSafeInteger(offset)||offset<0)return err(res,409,'Upload not active');
       if(job.writing)return err(res,409,'Upload busy');
       if(offset!==job.received)return err(res,409,'Unexpected chunk offset');
-      const length=Number(req.headers['content-length']);
-      if(!Number.isSafeInteger(length)||length<1||length>MAX_CHUNK||offset+length>job.total)return err(res,413,'Invalid chunk length');
+      const rawLength=req.headers['content-length'];
+      const length=rawLength===undefined?null:Number(rawLength);
+      if(length!==null&&(!Number.isSafeInteger(length)||length<1||length>MAX_CHUNK||offset+length>job.total))return err(res,413,'Invalid chunk length');
       if(req.headers['content-type']!=='application/octet-stream')return err(res,415,'Expected binary chunk');
       job.writing=true;let received=0;
       try{
-        await pipeline(req,new Transform({transform(chunk,_,done){received+=chunk.length;if(received>length)return done(Error('Oversize chunk'));done(null,chunk)}}),createWriteStream(join(job.dir,'upload.lrec'),{flags:'a',mode:0o600}));
-        if(received!==length)throw Error('Short chunk');
+        await pipeline(req,new Transform({transform(chunk,_,done){received+=chunk.length;if(received>MAX_CHUNK||offset+received>job.total||(length!==null&&received>length))return done(Error('Oversize chunk'));done(null,chunk)}}),createWriteStream(join(job.dir,'upload.lrec'),{flags:'a',mode:0o600}));
+        if(received<1||(length!==null&&received!==length))throw Error('Short chunk');
         job.received+=received;job.lastActivity=Date.now();
         return reply(res,200,{status:'uploading',received:job.received,total:job.total});
       }catch(e){
