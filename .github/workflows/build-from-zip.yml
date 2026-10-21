@@ -2,7 +2,7 @@ name: Build and publish SVU LREC Engine
 on:
   push:
     branches: [main]
-    paths: ['SVU-LREC-Coolify-Engine-v0.1.0.zip', '.github/workflows/build-from-zip.yml']
+    paths: ['SVU-LREC-Coolify-Engine-v0.1.0.zip']
   workflow_dispatch:
 permissions:
   contents: read
