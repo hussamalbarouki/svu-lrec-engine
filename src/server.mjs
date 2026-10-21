@@ -1,7 +1,7 @@
 import http from 'node:http';
 import {createHmac,randomUUID,timingSafeEqual} from 'node:crypto';
 import {createWriteStream} from 'node:fs';
-import {mkdir,rm,stat,statfs,unlink} from 'node:fs/promises';
+import {mkdir,rm,stat,statfs,unlink,truncate} from 'node:fs/promises';
 import {Transform} from 'node:stream';
 import {pipeline} from 'node:stream/promises';
 import {join} from 'node:path';
@@ -14,6 +14,8 @@ const WORK_ROOT=process.env.WORK_ROOT||'/work';
 const MAX_UPLOAD=Math.min(2048,Math.max(1,Number(process.env.MAX_UPLOAD_MB||256)))*1048576;
 const TTL=Number(process.env.RESULT_TTL_MINUTES||30)*60000;
 const QUEUE_LIMIT=Number(process.env.QUEUE_LIMIT||2);
+const MAX_CHUNK=4*1048576; // 4 MiB cap; browser sends 1 MiB chunks
+
 if(SECRET.length<32)throw Error('ENGINE_SHARED_SECRET must have at least 32 random characters');
 if(!/^https:\/\/[a-z0-9.-]+(?::\d+)?$/i.test(ORIGIN))throw Error('APP_ORIGIN must be HTTPS origin');
 const jobs=new Map();const queue=[];let active=null;
@@ -44,7 +46,9 @@ function pump(){
     .finally(async()=>{try{await unlink(join(job.dir,'upload.lrec'))}catch{};active=null;pump();});
 }
 async function cleanup(){
-  for(const [id,job] of jobs){if(job.status==='processing'||job.status==='queued'||job.status==='uploading')continue;
+  for(const [id,job] of jobs){
+    if(job.status==='uploading'&&!job.writing&&Date.now()-(job.lastActivity||job.created)>30*60000){jobs.delete(id);await rm(job.dir,{recursive:true,force:true}).catch(()=>{});continue;}
+    if(job.status==='processing'||job.status==='queued'||job.status==='uploading')continue;
     if(job.finished&&Date.now()-job.finished>TTL){jobs.delete(id);await rm(job.dir,{recursive:true,force:true}).catch(()=>{})}}
 }
 setInterval(()=>cleanup().catch(console.error),60000).unref();
@@ -53,14 +57,66 @@ const server=http.createServer(async(req,res)=>{
   try{
     const origin=req.headers.origin;
     if(origin && origin!==ORIGIN)return err(res,403,'Origin not allowed');
-    if(origin===ORIGIN){res.setHeader('access-control-allow-origin',ORIGIN);res.setHeader('vary','Origin');res.setHeader('access-control-allow-methods','GET,POST,DELETE,OPTIONS');res.setHeader('access-control-allow-headers','Authorization,Content-Type');res.setHeader('access-control-max-age','300');}
+    if(origin===ORIGIN){res.setHeader('access-control-allow-origin',ORIGIN);res.setHeader('vary','Origin');res.setHeader('access-control-allow-methods','GET,POST,DELETE,OPTIONS');res.setHeader('access-control-allow-headers','Authorization,Content-Type,X-Upload-Total,X-Upload-Offset');res.setHeader('access-control-max-age','300');}
     if(req.method==='OPTIONS'){res.writeHead(204);res.end();return;}
     const pathname=new URL(req.url,'http://localhost').pathname;
-    if(pathname==='/healthz'&&req.method==='GET')return reply(res,200,{status:'ok',engine:'svu-lrec-native',version:'0.1.0',active:active?1:0,queued:queue.length});
-    const hit=/^\/api\/jobs\/([0-9a-f-]{36})(?:\/(upload|output))?$/.exec(pathname);
+    if(pathname==='/healthz'&&req.method==='GET')return reply(res,200,{status:'ok',engine:'svu-lrec-native',version:'0.2.0',features:{chunk_upload:true,max_chunk_bytes:MAX_CHUNK},active:active?1:0,queued:queue.length});
+    const hit=/^\/api\/jobs\/([0-9a-f-]{36})(?:\/(upload\/(?:init|state|chunk|finish)|upload|output))?$/.exec(pathname);
     if(!hit)return err(res,404,'Not found');
     const id=hit[1],action=hit[2]||'',claims=signedToken(req);
     if(id!==claims.job_id)return err(res,403,'Token not valid for this job');
+    // Resumable direct-to-VPS upload. The main website never receives file contents.
+    if(action==='upload/init'&&req.method==='POST'){
+      const total=Number(req.headers['x-upload-total']);
+      if(!Number.isSafeInteger(total)||total<32||total>Math.min(MAX_UPLOAD,claims.max_bytes))return err(res,413,'Invalid file size');
+      let existing=jobs.get(id);
+      if(existing){
+        if(existing.status!=='uploading'||existing.total!==total)return err(res,409,'Job already active');
+        return reply(res,200,{received:existing.received,total,status:'uploading'});
+      }
+      if(queue.length>=QUEUE_LIMIT)return err(res,503,'Engine busy');
+      const fs=await statfs(WORK_ROOT);
+      if(Number(fs.bavail)*Number(fs.bsize)<total+256*1048576)return err(res,507,'Not enough free disk space');
+      const dir=join(WORK_ROOT,id);
+      await mkdir(dir,{recursive:false});
+      const job={id,dir,created:Date.now(),lastActivity:Date.now(),status:'uploading',progress:0,stage:'رفع الملف',total,received:0,writing:false};
+      jobs.set(id,job);
+      return reply(res,201,{received:0,total,status:'uploading'});
+    }
+    if(action==='upload/state'&&req.method==='GET'){
+      const job=jobs.get(id);
+      if(!job)return err(res,404,'Job not found');
+      return reply(res,200,{status:job.status,received:job.received??null,total:job.total??null});
+    }
+    if(action==='upload/chunk'&&req.method==='POST'){
+      const job=jobs.get(id),offset=Number(req.headers['x-upload-offset']);
+      if(!job||job.status!=='uploading'||!Number.isSafeInteger(offset)||offset<0)return err(res,409,'Upload not active');
+      if(job.writing)return err(res,409,'Upload busy');
+      if(offset!==job.received)return err(res,409,'Unexpected chunk offset');
+      const length=Number(req.headers['content-length']);
+      if(!Number.isSafeInteger(length)||length<1||length>MAX_CHUNK||offset+length>job.total)return err(res,413,'Invalid chunk length');
+      if(req.headers['content-type']!=='application/octet-stream')return err(res,415,'Expected binary chunk');
+      job.writing=true;let received=0;
+      try{
+        await pipeline(req,new Transform({transform(chunk,_,done){received+=chunk.length;if(received>length)return done(Error('Oversize chunk'));done(null,chunk)}}),createWriteStream(join(job.dir,'upload.lrec'),{flags:'a',mode:0o600}));
+        if(received!==length)throw Error('Short chunk');
+        job.received+=received;job.lastActivity=Date.now();
+        return reply(res,200,{status:'uploading',received:job.received,total:job.total});
+      }catch(e){
+        await truncate(join(job.dir,'upload.lrec'),offset).catch(()=>{});
+        return err(res,400,'Incomplete chunk; retry');
+      }finally{job.writing=false;}
+    }
+    if(action==='upload/finish'&&req.method==='POST'){
+      const job=jobs.get(id);
+      if(!job)return err(res,404,'Upload not found');
+      if(job.status==='queued'||job.status==='processing'||job.status==='complete')return reply(res,200,status(job));
+      if(job.status!=='uploading'||job.writing||job.received!==job.total)return err(res,409,'Upload incomplete');
+      const m=await stat(join(job.dir,'upload.lrec'));
+      if(m.size!==job.total)return err(res,409,'File size mismatch');
+      job.status='queued';job.stage='بانتظار المعالجة';job.lastActivity=Date.now();
+      queue.push(job);pump();return reply(res,202,status(job));
+    }
     if(action==='upload'&&req.method==='POST'){
       if(jobs.has(id))return err(res,409,'Job already exists');
       if(queue.length>=QUEUE_LIMIT||active&&queue.length>=QUEUE_LIMIT)return err(res,503,'Engine busy, retry later');
@@ -81,7 +137,7 @@ const server=http.createServer(async(req,res)=>{
     const job=jobs.get(id);if(!job)return err(res,404,'Job unavailable or expired');
     if(action===''&&req.method==='GET')return reply(res,200,status(job));
     if(action===''&&req.method==='DELETE'){
-      if(job.status==='processing')return err(res,409,'Cannot cancel an active conversion yet');
+      if(job.status==='processing'||job.status==='complete'||job.writing)return err(res,409,'Cannot cancel active or completed conversion');
       jobs.delete(id);const at=queue.indexOf(job);if(at!==-1)queue.splice(at,1);
       await rm(job.dir,{recursive:true,force:true});return reply(res,200,{status:'removed'});
     }
@@ -95,4 +151,4 @@ const server=http.createServer(async(req,res)=>{
   }catch(e){console.error('Request rejected:',String(e.message||e));if(!res.headersSent)err(res,401,'Unauthorized or invalid request');else res.destroy();}
 });
 server.requestTimeout=30*60*1000;server.headersTimeout=20000;
-server.listen(PORT,'0.0.0.0',()=>console.log(`SVU LREC native engine v0.1.0 on :${PORT}`));
+server.listen(PORT,'0.0.0.0',()=>console.log(`SVU LREC native engine v0.2.0 on :${PORT}`));
