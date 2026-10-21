@@ -1,1 +1,13 @@
-{"name":"svu-lrec-engine","version":"0.1.0","type":"module","private":true,"engines":{"node":">=22"},"scripts":{"start":"node src/server.mjs","test:smoke":"node tests/smoke.mjs"}}
+{
+  "name": "svu-lrec-engine",
+  "version": "0.3.0",
+  "type": "module",
+  "private": true,
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "start": "node src/server.mjs",
+    "test:smoke": "node tests/smoke.mjs"
+  }
+}
