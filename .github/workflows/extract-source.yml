@@ -1,0 +1,40 @@
+name: Extract LREC engine for direct Coolify builds
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'SVU-LREC-Coolify-Engine-v0.1.0.zip'
+      - '.github/workflows/extract-source.yml'
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  unpack:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Extract validated engine sources
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s SVU-LREC-Coolify-Engine-v0.1.0.zip
+          mkdir -p "$RUNNER_TEMP/lrec-source"
+          unzip -q -o SVU-LREC-Coolify-Engine-v0.1.0.zip -d "$RUNNER_TEMP/lrec-source"
+          test -s "$RUNNER_TEMP/lrec-source/Dockerfile"
+          test -s "$RUNNER_TEMP/lrec-source/src/server.mjs"
+          test -s "$RUNNER_TEMP/lrec-source/src/converter.mjs"
+          mkdir -p src tests
+          cp -a "$RUNNER_TEMP/lrec-source/src/." src/
+          cp -a "$RUNNER_TEMP/lrec-source/tests/." tests/
+          cp "$RUNNER_TEMP/lrec-source/Dockerfile" Dockerfile
+          cp "$RUNNER_TEMP/lrec-source/package.json" package.json
+          cp "$RUNNER_TEMP/lrec-source/.dockerignore" .dockerignore
+          cp "$RUNNER_TEMP/lrec-source/DEPLOY_NOTES_AR.md" DEPLOY_NOTES_AR.md
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src tests Dockerfile package.json .dockerignore DEPLOY_NOTES_AR.md
+          if ! git diff --cached --quiet; then
+            git commit -m "Unpack cloud engine source for Coolify Dockerfile builds"
+            git push origin HEAD:main
+          fi
