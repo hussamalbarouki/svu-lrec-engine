@@ -3,7 +3,7 @@ import {join} from 'node:path';
 import {execFile} from 'node:child_process';
 import {promisify} from 'node:util';
 import {analyze,convert} from './converter.mjs';
-import {DiskDirectory} from './native-ffmpeg.mjs';
+import {DiskDirectory,NativeFFmpeg} from './native-ffmpeg.mjs';
 const exec=promisify(execFile);
 import {makeRenderer,decodeAudio} from './converter.mjs';
 import {pngRGB} from './png.mjs';
