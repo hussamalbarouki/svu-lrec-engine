@@ -1,0 +1,9 @@
+.git
+.github
+node_modules
+*.lrec
+*.mp4
+*.zip
+tests
+.env*
+work
