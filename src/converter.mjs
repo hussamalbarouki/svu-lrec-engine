@@ -171,7 +171,7 @@ async function newEngine(progress){
   return new NativeFFmpeg();
 }
 function ensureSuccess(status,label){if(status!==0) fail('فشل المحرك أثناء '+label+' (رمز '+status+'). راجع الدعم المتاح للترميز.');}
-async function decodeAudio(record,engine,update,signal){
+export async function decodeAudio(record,engine,update,signal){
   const samples=Math.ceil(record.duration*8);const mix=new Int32Array(samples);
   const streams=[...record.audios.values()];let idx=0;
   for(const packets of streams){
